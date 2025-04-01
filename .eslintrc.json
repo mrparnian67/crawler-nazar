@@ -1,0 +1,12 @@
+{
+  "extends": ["airbnb-base", "prettier"],
+  "rules": {
+    "no-console": "off",
+    "class-methods-use-this": "off",
+    "import/no-extraneous-dependencies": ["error", {"devDependencies": true}]
+  },
+  "env": {
+    "node": true,
+    "es6": true
+  }
+}
