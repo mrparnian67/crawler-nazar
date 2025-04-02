@@ -3,17 +3,33 @@ const fs = require('fs');
 const { FILES, SELECTORS, BROWSER } = require('../config/constants');
 const BrowserManager = require('./browser');
 const logger = require('../utils/logger');
-const { sleep, formatDuration } = require('../utils/helpers');
+const { sleep, formatDuration, getCurrentTimestamp } = require('../utils/helpers');
 
-class LinkProcessor {
+class EnhancedLinkProcessor {
     constructor() {
         this.maxRetries = parseInt(process.env.MAX_RETRIES) || 3;
         this.concurrency = BROWSER.MAX_CONCURRENCY;
         this.activeTasks = 0;
         this.taskQueue = [];
-        this.processedLinks = this.loadProcessedLinks();
-        this.browserInstance = null; // مرورگر ثابت
+        this.processedData = this.loadProcessedData(); // تغییر از processedLinks به processedData
+        this.browserInstance = null;
         this.ensureOutputDirectory();
+        this.setupExitHandlers();
+    }
+
+    setupExitHandlers() {
+        // ذخیره وضعیت هنگام خروج غیرمنتظره
+        process.on('SIGINT', async () => {
+            logger.warn('Received SIGINT. Saving state before exit...');
+            await this.cleanup();
+            process.exit(0);
+        });
+
+        process.on('uncaughtException', async (err) => {
+            logger.error('Uncaught exception:', err);
+            await this.cleanup();
+            process.exit(1);
+        });
     }
 
     ensureOutputDirectory() {
@@ -23,30 +39,40 @@ class LinkProcessor {
         }
     }
 
-    loadProcessedLinks() {
+    loadProcessedData() {
         const statePath = path.join(__dirname, '../../', FILES.STATUS);
         if (fs.existsSync(statePath)) {
-            return new Set(JSON.parse(fs.readFileSync(statePath, 'utf8')));
+            try {
+                const data = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+                // تبدیل آرایه به Map و حذف URL تکراری
+                return new Map(data);
+            } catch (e) {
+                logger.error('Error parsing status file, creating new one:', e);
+                return new Map();
+            }
         }
-        return new Set();
+        return new Map();
     }
 
-    saveProcessedLinks() {
+    saveProcessedData() {
         const statePath = path.join(__dirname, '../../', FILES.STATUS);
-        fs.writeFileSync(statePath, JSON.stringify([...this.processedLinks], null, 2));
+        // ذخیره به صورت آرایه از جفت‌های [key, value]
+        const dataToSave = Array.from(this.processedData.entries());
+        fs.writeFileSync(statePath, JSON.stringify(dataToSave, null, 2));
+    }
+
+    async cleanup() {
+        if (this.browserInstance) {
+            await this.browserInstance.close();
+        }
+        this.saveProcessedData();
     }
 
     loadLinks() {
         try {
             const filePath = path.join(__dirname, '../../', FILES.LINKS);
             const data = fs.readFileSync(filePath, 'utf8');
-            const links = JSON.parse(data);
-
-            if (!Array.isArray(links)) {
-                throw new Error('Links file does not contain valid array');
-            }
-
-            return links ;
+            return JSON.parse(data);
         } catch (error) {
             logger.error('Error loading links:', error);
             throw error;
@@ -55,48 +81,169 @@ class LinkProcessor {
 
     async processLinks() {
         try {
-            const links = this.loadLinks().filter(url => !this.processedLinks.has(url));
-            if (links.length === 0) {
-                logger.warn('No new links to process');
+            const links = this.loadLinks();
+            const pendingLinks = links.filter(url => {
+                const existing = this.processedData.get(url);
+                return !existing || existing.status !== 'completed';
+            });
+
+            if (pendingLinks.length === 0) {
+                logger.warn('No pending links to process');
                 return;
             }
 
             this.browserInstance = await BrowserManager.launch();
-            logger.info(`Processing ${links.length} new links with concurrency ${this.concurrency}`);
+            logger.info(`Processing ${pendingLinks.length} pending links`);
 
-            // ایجاد تمام تسک‌ها به صورت موازی با محدودیت concurrency
-            await Promise.all(links.map(url =>
-                this.enqueueTask(url)
-            ));
-
+            await Promise.all(pendingLinks.map(url => this.enqueueTask(url)));
             await this.drainQueue();
-            await this.browserInstance.close();
-            this.saveProcessedLinks();
+            await this.cleanup();
         } catch (error) {
             logger.error('Error in processLinks:', error);
+            await this.cleanup();
         }
     }
 
     async enqueueTask(url) {
         return new Promise((resolve) => {
             const task = async () => {
+                // اگر URL قبلاً پردازش شده، داده‌های موجود را بارگیری می‌کنیم
+                const existingData = this.processedData.get(url) || {
+                    startTime: getCurrentTimestamp(),
+                    attempts: []
+                };
+
                 try {
-                    logger.info(`Processing URL: ${url}`);
-                    const content = await this.processLinkWithRetry(url);
-                    this.saveResult(url, content);
-                    this.processedLinks.add(url);
+                    const result = await this.processLinkWithRetry(url, existingData);
+
+                    // به‌روزرسانی وضعیت با داده‌های جدید
+                    this.processedData.set(url, {
+                        ...existingData,
+                        endTime: getCurrentTimestamp(),
+                        status: 'completed',
+                        ...result
+                    });
+
+                    this.saveResult(url, result.content);
                 } catch (error) {
-                    logger.error(`Failed to process ${url}: ${error.message}`);
+                    this.processedData.set(url, {
+                        ...existingData,
+                        endTime: getCurrentTimestamp(),
+                        status: 'failed',
+                        error: error.message
+                    });
                 } finally {
+                    this.saveProcessedData();
                     resolve();
                 }
             };
+
             this.taskQueue.push(task);
             this.runNextTask();
         });
     }
 
-    async runNextTask() {
+    async processLinkWithRetry(url, existingData) {
+        let attempt = 0;
+        const attempts = existingData.attempts || [];
+
+        while (attempt < this.maxRetries) {
+            attempt++;
+            const attemptData = {
+                attemptNumber: attempt,
+                startTime: getCurrentTimestamp()
+            };
+
+            try {
+                const content = await this.attemptProcessing(url, attemptData);
+                return {
+                    content,
+                    attempts: [...attempts, {
+                        ...attemptData,
+                        status: 'success',
+                        endTime: getCurrentTimestamp()
+                    }]
+                };
+            } catch (error) {
+                attempts.push({
+                    ...attemptData,
+                    status: 'failed',
+                    endTime: getCurrentTimestamp(),
+                    error: error.message
+                });
+
+                if (attempt < this.maxRetries) {
+                    await sleep(2000 * attempt);
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+
+    async attemptProcessing(url, attemptData) {
+        const page = await BrowserManager.newPage(this.browserInstance);
+        try {
+            attemptData.pageLoadStart = getCurrentTimestamp();
+            await page.goto(url, {
+                waitUntil: 'domcontentloaded',
+                timeout: BROWSER.TIMEOUT
+            });
+            attemptData.pageLoadEnd = getCurrentTimestamp();
+
+            const content = await this.extractContentWithMetrics(page, attemptData);
+            return content;
+        } finally {
+            await page.close();
+        }
+    }
+
+    async extractContentWithMetrics(page, attemptData) {
+        try {
+            attemptData.contentExtractionStart = getCurrentTimestamp();
+            await this.checkSelectors(page);
+
+            const content = await page.evaluate((selectors) => {
+                const getContent = (selector) => {
+                    const el = document.querySelector(selector);
+                    return el ? el.textContent.trim() : null;
+                };
+
+                return {
+                    question: getContent(selectors.QUESTION),
+                    answer: getContent(selectors.ANSWER),
+                    pageTitle: document.title,
+                    url: window.location.href
+                };
+            }, SELECTORS);
+
+            attemptData.contentExtractionEnd = getCurrentTimestamp();
+            return content;
+        } catch (error) {
+            attemptData.contentError = error.message;
+            throw error;
+        }
+    }
+
+    saveResult(url, content) {
+        const outputDir = path.join(__dirname, '../../', FILES.OUTPUT_DIR);
+
+        // استخراج 5 کلمه اول از عنوان صفحه (در صورت وجود)
+        const titleWords = content?.pageTitle?.split(/\s+/)?.slice(0, 5) || [];
+        const cleanTitle = titleWords.join('_').replace(/[^\w]/g, '');
+
+        // تولید نام فایل
+        const filename = `result_${cleanTitle || 'no-title'}_${Date.now()}.json`;
+        const filePath = path.join(outputDir, filename);
+
+        fs.writeFileSync(filePath, JSON.stringify({
+            url, // ذخیره URL اصلی
+            timestamp: getCurrentTimestamp(),
+            content
+        }, null, 2));
+    }
+
+    runNextTask() {
         while (this.activeTasks < this.concurrency && this.taskQueue.length > 0) {
             this.activeTasks++;
             const task = this.taskQueue.shift();
@@ -107,58 +254,10 @@ class LinkProcessor {
         }
     }
 
-    async processLinkWithRetry(url) {
-        let attempt = 0;
-        while (attempt < this.maxRetries) {
-            attempt++;
-            try {
-                return await this.attemptProcessing(url);
-            } catch (error) {
-                if (attempt < this.maxRetries) {
-                    await sleep(2000 * attempt);
-                } else {
-                    throw error;
-                }
-            }
+    async drainQueue() {
+        while (this.activeTasks > 0 || this.taskQueue.length > 0) {
+            await sleep(100);
         }
-    }
-
-    async attemptProcessing(url) {
-        const page = await BrowserManager.newPage(this.browserInstance);
-        try {
-            await page.goto(url, { waitUntil: 'networkidle2', timeout: BROWSER.TIMEOUT });
-            const content = await this.extractContent(page);
-            return content;
-        } finally {
-            await page.close();
-        }
-    }
-
-    saveResult(url, content) {
-        const outputDir = path.join(__dirname, '../../', FILES.OUTPUT_DIR);
-        const filePath = path.join(outputDir, `result_${Date.now()}.json`);
-        fs.writeFileSync(filePath, JSON.stringify({ url, content }, null, 2));
-    }
-
-    async extractContent(page) {
-        // بررسی وجود عناصر قبل از استخراج
-        await this.checkSelectors(page);
-
-        return await page.evaluate((selectors) => {
-            const getContent = (selector) => {
-                const el = document.querySelector(selector);
-                if (!el) {
-                    console.error(`Element not found for selector: ${selector}`);
-                    return null;
-                }
-                return el.textContent.trim();
-            };
-
-            return {
-                question: getContent(selectors.QUESTION),
-                answer: getContent(selectors.ANSWER)
-            };
-        }, SELECTORS);
     }
 
     async checkSelectors(page) {
@@ -182,11 +281,7 @@ class LinkProcessor {
         }
     }
 
-    async drainQueue() {
-        while (this.activeTasks > 0 || this.taskQueue.length > 0) {
-            await sleep(100);
-        }
-    }
+    // ... (بقیه متدها مانند قبل)
 }
 
-module.exports = new LinkProcessor();
+module.exports = new EnhancedLinkProcessor();

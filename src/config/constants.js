@@ -1,8 +1,8 @@
 module.exports = {
     FILES: {
         LINKS: 'data/crawler_links.json',
-        OUTPUT_DIR: 'data/links',
-        STATUS: 'data/processing_status.json'
+        OUTPUT_DIR: 'output/results',
+        STATUS: 'output/processing_status.json' // تغییر نام فایل وضعیت
     },
     SELECTORS: {
         QUESTION: 'div[title*="موضوع نظریه"]',

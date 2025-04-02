@@ -1,12 +1,19 @@
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-const formatDuration = ms => {
-    if (ms < 1000) return `${ms}ms`;
-    if (ms < 60000) return `${(ms / 1000).toFixed(2)}s`;
-    return `${Math.floor(ms / 60000)}m ${((ms % 60000) / 1000).toFixed(0)}s`;
-};
+function getCurrentTimestamp() {
+    return new Date().toISOString();
+}
+
+function formatDuration(ms) {
+    const seconds = Math.floor((ms / 1000) % 60);
+    const minutes = Math.floor((ms / (1000 * 60)) % 60);
+    const hours = Math.floor((ms / (1000 * 60 * 60)) % 24);
+
+    return `${hours}h ${minutes}m ${seconds}s`;
+}
 
 module.exports = {
     sleep,
+    getCurrentTimestamp,
     formatDuration
 };
