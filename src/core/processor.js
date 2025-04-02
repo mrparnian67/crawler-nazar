@@ -62,11 +62,12 @@ class LinkProcessor {
             }
 
             this.browserInstance = await BrowserManager.launch();
-            logger.info(`Processing ${links.length} new links`);
+            logger.info(`Processing ${links.length} new links with concurrency ${this.concurrency}`);
 
-            for (const url of links) {
-                await this.enqueueTask(url);
-            }
+            // ایجاد تمام تسک‌ها به صورت موازی با محدودیت concurrency
+            await Promise.all(links.map(url =>
+                this.enqueueTask(url)
+            ));
 
             await this.drainQueue();
             await this.browserInstance.close();
