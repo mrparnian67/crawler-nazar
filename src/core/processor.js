@@ -125,23 +125,31 @@ class EnhancedLinkProcessor {
 
                 try {
                     const result = await this.processLinkWithRetry(url, existingData);
-                    const contentFilePath = this.saveResult(url, result.content);
+                    const filename = await this.saveResult(url, result.content);
 
                     this.processedData.set(url, {
                         ...existingData,
                         endTime: getCurrentTimestamp(),
                         status: 'completed',
-                        contentFilePath,
-                        attempts: result.attempts
+                        contentFile: filename,
+                        attempts: result.attempts,
+                        pageTitle: result.content.pageTitle // ذخیره عنوان صفحه
                     });
 
                 } catch (error) {
+                    // اگر خطا در حین پردازش رخ داد، حداقل URL را ذخیره می‌کنیم
+                    const filename = await this.saveResult(url, {
+                        pageTitle: `Failed to load - ${url}`,
+                        error: error.message
+                    });
+
                     this.processedData.set(url, {
                         ...existingData,
                         endTime: getCurrentTimestamp(),
                         status: 'failed',
                         error: error.message,
-                        attempts: existingData.attempts
+                        attempts: existingData.attempts,
+                        contentFile: filename
                     });
                 } finally {
                     this.saveProcessedData();
@@ -202,8 +210,14 @@ class EnhancedLinkProcessor {
             });
             attemptData.pageLoadEnd = getCurrentTimestamp();
 
+            // استخراج عنوان صفحه قبل از استخراج محتوا
+            const pageTitle = await page.title();
             const content = await this.extractContentWithMetrics(page, attemptData);
-            return content;
+
+            return {
+                ...content,
+                pageTitle: pageTitle || `No title - ${url}`
+            };
         } finally {
             await page.close();
         }
@@ -223,6 +237,7 @@ class EnhancedLinkProcessor {
                 return {
                     question: getContent(selectors.QUESTION),
                     answer: getContent(selectors.ANSWER),
+                    // عنوان صفحه قبلاً گرفته شده است
                     pageTitle: document.title,
                     url: window.location.href
                 };
@@ -236,33 +251,40 @@ class EnhancedLinkProcessor {
         }
     }
 
-    saveResult(url, content) {
+    async saveResult(url, content) {
         const outputDir = path.join(__dirname, '../../', FILES.OUTPUT_DIR);
 
-        // تولید نام فایل کوتاه
-        const titlePart = content?.pageTitle?.split(/\s+/).slice(0, 5).join('_').replace(/[^\w]/g, '') || 'no-title';
+        // اگر عنوان صفحه وجود نداشت، از URL استفاده می‌کنیم
+        let titlePart = '';
+        if (content?.pageTitle) {
+            titlePart = content.pageTitle.split(/\s+/).slice(0, 5).join('_')
+                .replace(/[^\w]/g, '').substring(0, 100); // محدودیت طول
+        } else {
+            // استخراج بخش معنادار از URL
+            titlePart = url.replace(/^https?:\/\//, '')
+                .replace(/\/.*$/, '')
+                .replace(/[^\w]/g, '_')
+                .substring(0, 50);
+        }
+
         const filename = `result_${titlePart}_${Date.now()}.json`;
         const filePath = path.join(outputDir, filename);
 
-        // ساختار فایل خروجی
-        const resultData = {
+        // اگر محتوا عنوان نداشت، آن را اضافه می‌کنیم
+        if (!content.pageTitle) {
+            content.pageTitle = `No title - ${url}`;
+        }
+
+        fs.writeFileSync(filePath, JSON.stringify({
             metadata: {
                 url,
                 processedAt: getCurrentTimestamp(),
                 sourceFile: filename
             },
-            content: {
-                question: content.question,
-                answer: content.answer,
-                pageTitle: content.pageTitle,
-                screenshot: content.screenshotPath // در صورت وجود
-            }
-        };
+            content
+        }, null, 2));
 
-        fs.writeFileSync(filePath, JSON.stringify(resultData, null, 2));
-
-        // برگرداندن مسیر فایل برای ذخیره در وضعیت پردازش
-        return path.relative(outputDir, filePath);
+        return filename;
     }
 
     runNextTask() {
