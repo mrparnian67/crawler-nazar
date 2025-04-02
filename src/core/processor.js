@@ -46,7 +46,6 @@ class EnhancedLinkProcessor {
         fs.writeFileSync(statePath, JSON.stringify(dataToSave, null, 2));
     }
 
-// متد loadProcessedData به این صورت تغییر می‌کند:
     loadProcessedData() {
         const statePath = path.join(__dirname, '../../', FILES.STATUS);
         if (fs.existsSync(statePath)) {
@@ -54,9 +53,20 @@ class EnhancedLinkProcessor {
                 const dataArray = JSON.parse(fs.readFileSync(statePath, 'utf8'));
                 const dataMap = new Map();
 
-                // تبدیل آرایه به Map با کلید URL
                 dataArray.forEach(item => {
                     if (item && item.url) {
+                        // تبدیل ساختار قدیم به جدید اگر نیاز باشد
+                        if (!item.attempts) {
+                            item.attempts = [];
+                            if (item.status === 'failed') {
+                                item.attempts.push({
+                                    attemptNumber: 1,
+                                    status: 'failed',
+                                    error: item.error || 'Unknown error',
+                                    timestamp: item.endTime || item.startTime
+                                });
+                            }
+                        }
                         dataMap.set(item.url, item);
                     }
                 });
@@ -91,9 +101,26 @@ class EnhancedLinkProcessor {
     async processLinks() {
         try {
             const links = this.loadLinks();
+            const now = Date.now();
+
             const pendingLinks = links.filter(url => {
                 const existing = this.processedData.get(url);
-                return !existing || existing.status !== 'completed';
+
+                if (!existing) {
+                    return true; // صفحه جدید
+                }
+
+                if (existing.status === 'completed') {
+                    return false; // صفحه قبلاً با موفقیت پردازش شده
+                }
+
+                if (existing.status === 'failed_permanent') {
+                    return false; // خطای دائمی - دیگر پردازش نمی‌شود
+                }
+
+                // محاسبه زمان مناسب برای تلاش مجدد
+                const nextRetryTime = this.getNextRetryTime(url);
+                return nextRetryTime <= now; // آیا زمان تلاش مجدد رسیده؟
             });
 
             if (pendingLinks.length === 0) {
@@ -124,6 +151,7 @@ class EnhancedLinkProcessor {
                 };
 
                 try {
+                    logger.info(`Processing URL: ${url}, attempt ${existingData.attempts.length + 1}`);
                     const result = await this.processLinkWithRetry(url, existingData);
                     const filename = await this.saveResult(url, result.content);
 
@@ -133,24 +161,40 @@ class EnhancedLinkProcessor {
                         status: 'completed',
                         contentFile: filename,
                         attempts: result.attempts,
-                        pageTitle: result.content.pageTitle // ذخیره عنوان صفحه
+                        pageTitle: result.content.pageTitle
                     });
 
                 } catch (error) {
-                    // اگر خطا در حین پردازش رخ داد، حداقل URL را ذخیره می‌کنیم
+                    const attempts = existingData.attempts.length + 1;
+                    const canRetryLater = attempts < this.maxTotalAttempts;
+
+                    // ذخیره اطلاعات خطا
                     const filename = await this.saveResult(url, {
                         pageTitle: `Failed to load - ${url}`,
-                        error: error.message
+                        error: error.message,
+                        attempt: attempts
                     });
 
                     this.processedData.set(url, {
                         ...existingData,
                         endTime: getCurrentTimestamp(),
-                        status: 'failed',
+                        status: canRetryLater ? 'failed_retryable' : 'failed_permanent',
                         error: error.message,
-                        attempts: existingData.attempts,
-                        contentFile: filename
+                        contentFile: filename,
+                        attempts: [...existingData.attempts, {
+                            attemptNumber: attempts,
+                            status: 'failed',
+                            error: error.message,
+                            timestamp: getCurrentTimestamp()
+                        }]
                     });
+
+                    if (canRetryLater) {
+                        const nextRetry = new Date(Date.now() + this.calculateRetryDelay(attempts));
+                        logger.warn(`Will retry ${url} at ${nextRetry.toISOString()}`);
+                    } else {
+                        logger.error(`Permanent failure for ${url} after ${attempts} attempts`);
+                    }
                 } finally {
                     this.saveProcessedData();
                     resolve();
@@ -169,7 +213,7 @@ class EnhancedLinkProcessor {
         while (attempt < this.maxRetries) {
             attempt++;
             const attemptData = {
-                attemptNumber: attempt,
+                attemptNumber: attempts.length + 1,
                 startTime: getCurrentTimestamp()
             };
 
@@ -180,7 +224,8 @@ class EnhancedLinkProcessor {
                     attempts: [...attempts, {
                         ...attemptData,
                         status: 'success',
-                        endTime: getCurrentTimestamp()
+                        endTime: getCurrentTimestamp(),
+                        duration: formatDuration(Date.now() - new Date(attemptData.startTime).getTime())
                     }]
                 };
             } catch (error) {
@@ -188,11 +233,14 @@ class EnhancedLinkProcessor {
                     ...attemptData,
                     status: 'failed',
                     endTime: getCurrentTimestamp(),
-                    error: error.message
+                    error: error.message,
+                    duration: formatDuration(Date.now() - new Date(attemptData.startTime).getTime())
                 });
 
                 if (attempt < this.maxRetries) {
-                    await sleep(2000 * attempt);
+                    const delay = this.calculateRetryDelay(attempt);
+                    logger.warn(`Retrying ${url} in ${delay}ms (attempt ${attempt + 1}/${this.maxRetries})`);
+                    await sleep(delay);
                 } else {
                     throw error;
                 }
@@ -254,13 +302,12 @@ class EnhancedLinkProcessor {
     async saveResult(url, content) {
         const outputDir = path.join(__dirname, '../../', FILES.OUTPUT_DIR);
 
-        // اگر عنوان صفحه وجود نداشت، از URL استفاده می‌کنیم
+        // تولید نام فایل
         let titlePart = '';
         if (content?.pageTitle) {
             titlePart = content.pageTitle.split(/\s+/).slice(0, 5).join('_')
-                .replace(/[^\w]/g, '').substring(0, 100); // محدودیت طول
+                .replace(/[^\w]/g, '').substring(0, 100);
         } else {
-            // استخراج بخش معنادار از URL
             titlePart = url.replace(/^https?:\/\//, '')
                 .replace(/\/.*$/, '')
                 .replace(/[^\w]/g, '_')
@@ -270,20 +317,21 @@ class EnhancedLinkProcessor {
         const filename = `result_${titlePart}_${Date.now()}.json`;
         const filePath = path.join(outputDir, filename);
 
-        // اگر محتوا عنوان نداشت، آن را اضافه می‌کنیم
-        if (!content.pageTitle) {
-            content.pageTitle = `No title - ${url}`;
-        }
-
-        fs.writeFileSync(filePath, JSON.stringify({
+        // ساختار نهایی فایل خروجی
+        const resultData = {
             metadata: {
                 url,
                 processedAt: getCurrentTimestamp(),
-                sourceFile: filename
+                sourceFile: filename,
+                status: content.error ? 'failed' : 'success'
             },
-            content
-        }, null, 2));
+            content: {
+                ...content,
+                url: url // تضمین وجود URL در محتوا
+            }
+        };
 
+        fs.writeFileSync(filePath, JSON.stringify(resultData, null, 2));
         return filename;
     }
 
@@ -325,7 +373,22 @@ class EnhancedLinkProcessor {
         }
     }
 
-    // ... (بقیه متدها مانند قبل)
+    calculateRetryDelay(attemptNumber) {
+        return Math.min(
+            this.retryDelay.initial * Math.pow(this.retryDelay.multiplier, attemptNumber - 1),
+            this.retryDelay.max
+        );
+    }
+
+    getNextRetryTime(url) {
+        const data = this.processedData.get(url);
+        if (!data || data.status !== 'failed_retryable') return 0;
+
+        const lastAttempt = data.attempts[data.attempts.length - 1];
+        const delay = this.calculateRetryDelay(data.attempts.length);
+        return new Date(lastAttempt.timestamp).getTime() + delay;
+    }
+
 }
 
 module.exports = new EnhancedLinkProcessor();
