@@ -39,26 +39,35 @@ class EnhancedLinkProcessor {
         }
     }
 
+    // متد saveProcessedData به این صورت تغییر می‌کند:
+    saveProcessedData() {
+        const statePath = path.join(__dirname, '../../', FILES.STATUS);
+        const dataToSave = Array.from(this.processedData.values()); // فقط مقادیر را ذخیره می‌کنیم
+        fs.writeFileSync(statePath, JSON.stringify(dataToSave, null, 2));
+    }
+
+// متد loadProcessedData به این صورت تغییر می‌کند:
     loadProcessedData() {
         const statePath = path.join(__dirname, '../../', FILES.STATUS);
         if (fs.existsSync(statePath)) {
             try {
-                const data = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-                // تبدیل آرایه به Map و حذف URL تکراری
-                return new Map(data);
+                const dataArray = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+                const dataMap = new Map();
+
+                // تبدیل آرایه به Map با کلید URL
+                dataArray.forEach(item => {
+                    if (item && item.url) {
+                        dataMap.set(item.url, item);
+                    }
+                });
+
+                return dataMap;
             } catch (e) {
                 logger.error('Error parsing status file, creating new one:', e);
                 return new Map();
             }
         }
         return new Map();
-    }
-
-    saveProcessedData() {
-        const statePath = path.join(__dirname, '../../', FILES.STATUS);
-        // ذخیره به صورت آرایه از جفت‌های [key, value]
-        const dataToSave = Array.from(this.processedData.entries());
-        fs.writeFileSync(statePath, JSON.stringify(dataToSave, null, 2));
     }
 
     async cleanup() {
@@ -107,30 +116,32 @@ class EnhancedLinkProcessor {
     async enqueueTask(url) {
         return new Promise((resolve) => {
             const task = async () => {
-                // اگر URL قبلاً پردازش شده، داده‌های موجود را بارگیری می‌کنیم
                 const existingData = this.processedData.get(url) || {
+                    url,
                     startTime: getCurrentTimestamp(),
-                    attempts: []
+                    attempts: [],
+                    status: 'processing'
                 };
 
                 try {
                     const result = await this.processLinkWithRetry(url, existingData);
+                    const contentFilePath = this.saveResult(url, result.content);
 
-                    // به‌روزرسانی وضعیت با داده‌های جدید
                     this.processedData.set(url, {
                         ...existingData,
                         endTime: getCurrentTimestamp(),
                         status: 'completed',
-                        ...result
+                        contentFilePath,
+                        attempts: result.attempts
                     });
 
-                    this.saveResult(url, result.content);
                 } catch (error) {
                     this.processedData.set(url, {
                         ...existingData,
                         endTime: getCurrentTimestamp(),
                         status: 'failed',
-                        error: error.message
+                        error: error.message,
+                        attempts: existingData.attempts
                     });
                 } finally {
                     this.saveProcessedData();
@@ -228,19 +239,30 @@ class EnhancedLinkProcessor {
     saveResult(url, content) {
         const outputDir = path.join(__dirname, '../../', FILES.OUTPUT_DIR);
 
-        // استخراج 5 کلمه اول از عنوان صفحه (در صورت وجود)
-        const titleWords = content?.pageTitle?.split(/\s+/)?.slice(0, 5) || [];
-        const cleanTitle = titleWords.join('_').replace(/[^\w]/g, '');
-
-        // تولید نام فایل
-        const filename = `result_${cleanTitle || 'no-title'}_${Date.now()}.json`;
+        // تولید نام فایل کوتاه
+        const titlePart = content?.pageTitle?.split(/\s+/).slice(0, 5).join('_').replace(/[^\w]/g, '') || 'no-title';
+        const filename = `result_${titlePart}_${Date.now()}.json`;
         const filePath = path.join(outputDir, filename);
 
-        fs.writeFileSync(filePath, JSON.stringify({
-            url, // ذخیره URL اصلی
-            timestamp: getCurrentTimestamp(),
-            content
-        }, null, 2));
+        // ساختار فایل خروجی
+        const resultData = {
+            metadata: {
+                url,
+                processedAt: getCurrentTimestamp(),
+                sourceFile: filename
+            },
+            content: {
+                question: content.question,
+                answer: content.answer,
+                pageTitle: content.pageTitle,
+                screenshot: content.screenshotPath // در صورت وجود
+            }
+        };
+
+        fs.writeFileSync(filePath, JSON.stringify(resultData, null, 2));
+
+        // برگرداندن مسیر فایل برای ذخیره در وضعیت پردازش
+        return path.relative(outputDir, filePath);
     }
 
     runNextTask() {
